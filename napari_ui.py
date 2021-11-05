@@ -22,13 +22,13 @@ import csv
 from sklearn.cluster import KMeans
 from magicgui import magicgui
 import argparse
-
+import time
 parser = argparse.ArgumentParser()
 parser.add_argument('--image_path', type=str, help='path of the input whole slide image')
 parser.add_argument('--model_path',type=str,help='path of the model to generate embedding')
 parser.add_argument('--prefix',type=str,help='path to store media result')
+parser.add_argument('--tile_size',type=int,help='tile size')
 args = parser.parse_args()
-
 def generate_pca_point(row,matrix,point_size):
     #print(matrix[0:10])
     matrix_min=np.min(matrix,axis=0)
@@ -97,13 +97,36 @@ def load_model_weights(model, weights):
 wsi = HESlide(args.image_path, name = "example")
 if not os.path.exists(args.prefix):
     os.makedirs(args.prefix)
-if not os.path.exists(args.prefix+"/media_data.pickle"):
+similar=False
+load_name=None
+for i in os.listdir(args.prefix):
+    if i.endswith('.pickle'):
+        load_name=os.path.join(args.prefix,i)
+        with open(load_name,'rb') as file:
+            loaded_file=pickle.load(file)
+        similar=True
+        if loaded_file['args'].tile_size!=args.tile_size:
+            similar=False
+            continue
+        media0=loaded_file['args'].image_path.split('/')[-1]
+        media1=args.image_path.split('/')[-1]
+        if media0!=media1:
+            similar=False
+            continue
+        media0=loaded_file['args'].model_path.split('/')[-1]
+        media1=args.model_path.split('/')[-1]
+        if media0!=media1:
+            similar=False
+            continue
+        if similar:
+            break
+if not similar:
+    print("no available preprocessed data, run preprocessing from begining")
     pipeline = Pipeline([
-        BoxBlur(kernel_size=4),
         TissueDetectionHE(mask_name = "tissue", min_region_size=500,
                           threshold=30, outer_contours_only=True)
     ])
-    wsi.run(pipeline, distributed=False,tile_size = 64)
+    wsi.run(pipeline, distributed=False,tile_size = args.tile_size)
     tissue_masks=[]
     for i in wsi.tiles:
         tissue_masks.append(int(np.sum(i.masks['tissue']!=0)))
@@ -160,16 +183,20 @@ if not os.path.exists(args.prefix+"/media_data.pickle"):
         for ti in wsi.tiles:
             features.append(list(get_features_eval(ti,model)[0]))
         return features
-    tile_ma = get_features_wsi_eval(wsi,model1)
+    with torch.no_grad():
+        tile_ma = get_features_wsi_eval(wsi,model1)
     assert len(coords)==len(tissue_masks)
     assert len(tile_ma)==len(tissue_masks)
     tile_ma=[tile_ma[i] for i in range(len(tile_ma)) if tissue_masks[i]>0]
     coords=[coords[i] for i in range((len(coords))) if tissue_masks[i]>0]
-    diction={'emb':tile_ma,'coords':coords}
-    with open(args.prefix+'/media_data.pickle','wb') as file:
+    diction={'emb':tile_ma,'coords':coords,'args':args}
+    now=str(int(time.time()))
+    file_name=args.image_path.split('/')[-1].split('.')[0]+now+'.pickle'
+    with open(os.path.join(args.prefix,file_name),'wb') as file:
         pickle.dump(diction,file)
 else:
-    with open(args.prefix+'/media_data.pickle','rb') as file:
+    print('load preprocessed data from '+load_name)
+    with open(load_name,'rb') as file:
         media=pickle.load(file)
         tile_ma=media["emb"]
         coords=media["coords"]
@@ -182,9 +209,8 @@ thumbnail = wsi.slide.get_thumbnail(size = (5000, 5000))
 color_list=['green','blue','orange','black','purple','yellow','pink']
 point_size=int(0.005*thumbnail.shape[0])
 layer2_data,point_matrix,min_col,min_row,max_row,max_col,matrix_min,matrix_max=generate_pca_point(thumbnail.shape[0],pca_matrix,point_size)
-tile_size=64
 line_width=8
-polys=gen_cluster_mask(coords,thumbnail.shape[0],thumbnail.data.shape[1],wsi.shape[0],wsi.shape[1],layer2_data.shape[1],tile_size)
+polys=gen_cluster_mask(coords,thumbnail.shape[0],thumbnail.data.shape[1],wsi.shape[0],wsi.shape[1],layer2_data.shape[1],args.tile_size)
 viewer = napari.Viewer()
 p_color_list=[color_list[i] for i in kmean.labels_]
 layer1=viewer.add_image(np.concatenate((layer2_data,thumbnail),axis=1),name='wsi')
