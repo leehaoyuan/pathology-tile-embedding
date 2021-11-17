@@ -14,7 +14,6 @@ import nest_asyncio
 nest_asyncio.apply()
 import torch
 import torchvision
-import timm
 from pathml.core import HESlide
 from sklearn.decomposition import PCA
 from pathml.preprocessing import Pipeline, BoxBlur, TissueDetectionHE
@@ -23,11 +22,14 @@ from sklearn.cluster import KMeans
 from magicgui import magicgui
 import argparse
 import time
+from PIL import Image
+from tqdm import tqdm
 parser = argparse.ArgumentParser()
 parser.add_argument('--image_path', type=str, help='path of the input whole slide image')
 parser.add_argument('--model_path',type=str,help='path of the model to generate embedding')
 parser.add_argument('--prefix',type=str,help='path to store media result')
 parser.add_argument('--tile_size',type=int,help='tile size')
+parser.add_argument('--level',type=int,help='perform embedding at which level of image. the higher the level, the quicker the preprocess')
 args = parser.parse_args()
 def generate_pca_point(row,matrix,point_size):
     #print(matrix[0:10])
@@ -70,15 +72,20 @@ def readincoord(file_path):
     return coord
 def gen_cluster_mask(coords,row,col,orig_row,orig_col,plot_col,tile_size):
     polys=[]
+    max_row=-1
     for i in range(len(coords)):
+        if coords[i][0]>max_row:
+            max_row=coords[i][0]
         media_x,media_y=transform_origpos(coords[i][0],coords[i][1],row,col,orig_row,orig_col,plot_col)
         media1_x,media1_y=transform_origpos(coords[i][0]+tile_size,coords[i][1]+tile_size,row,col,orig_row,orig_col,plot_col)
         media=np.array([[media_x,media_y],[media_x,media1_y],[media1_x,media1_y],[media1_x,media_y]],dtype=int)
         polys.append(media)
+    #print(max_row)
     return polys
 def gen_mask(coords,row,col,orig_row,orig_col,plot_col,tile_size,line_width):
     lines=[]
     ld=0.5*float(line_width)
+    print(row/orig_row)
     for i in range(len(coords)):
         media_x,media_y=transform_origpos(coords[i][0],coords[i][1],row,col,orig_row,orig_col,plot_col)
         media1_x,media1_y=transform_origpos(coords[i][0]+tile_size,coords[i][1]+tile_size,row,col,orig_row,orig_col,plot_col)
@@ -118,15 +125,35 @@ for i in os.listdir(args.prefix):
         if media0!=media1:
             similar=False
             continue
+        media0=loaded_file['args'].level
+        media1=args.level
+        if media0!=media1:
+            similar=False
+            continue
         if similar:
             break
 if not similar:
     print("no available preprocessed data, run preprocessing from begining")
-    pipeline = Pipeline([
-        TissueDetectionHE(mask_name = "tissue", min_region_size=500,
-                          threshold=30, outer_contours_only=True)
-    ])
-    wsi.run(pipeline, distributed=False,tile_size = args.tile_size)
+    level_app=args.level
+    if level_app is not None:
+        level_app=min(level_app,wsi.slide.slide.level_count-1)
+    if level_app is None:
+        level_app=0
+    level_i=min(wsi.slide.slide.level_count-1,level_app+1)
+    high_level = wsi.slide.extract_region(location = (0, 0), level = level_i, size = wsi.slide.get_image_shape(level = level_i))
+    tissue_detector = TissueDetectionHE()
+    tissue_mask_high_level = tissue_detector.F(high_level)
+    ratio=int(2**(level_i-level_app))
+    #print(ratio)
+    """
+    tissue_mask_high_level=Image.fromarray(tissue_mask_high_level)
+    tissue_mask_full_level=tissue_mask_high_level.resize(wsi.slide.get_image_shape(level_app))
+    tissue_mask_full_level=np.array(tissue_mask_full_level,dtype='uint8')
+    tissue_mask_full_level=tissue_mask_full_level.transpose()
+    del(tissue_mask_high_level)
+    wsi.masks.add("tissue", tissue_mask_full_level)
+    pipeline = Pipeline([])
+    wsi.run(pipeline, distributed=False,tile_size = args.tile_size,level=level_app)
     tissue_masks=[]
     for i in wsi.tiles:
         tissue_masks.append(int(np.sum(i.masks['tissue']!=0)))
@@ -134,24 +161,26 @@ if not similar:
     coords = []
     for i in range(num_tiles):
         coords.append(wsi.tiles[i].coords)
+    """
     ###load Model
     model1 = torchvision.models.__dict__['resnet18'](pretrained=False)
     state = torch.load(args.model_path, map_location=torch.device('cpu'))
-
     state_dict = state['state_dict']
     for key in list(state_dict.keys()):
         state_dict[key.replace('model.', '').replace('resnet.', '')] = state_dict.pop(key)
 
     model1 = load_model_weights(model1, state_dict)
     model1.fc = torch.nn.Sequential()
+    model1.eval()
     ###Generate Embedding
     def get_features_eval(t,model):
         """
         t: single tile in SlideData object, eg wsi.tiles[0] 
         model: model loaded
+        
         """
         # transpose to 3,32,32, then tensor, 
-        test = torch.tensor(t.image.transpose([2,1,0]))
+        test = torch.tensor(t.transpose([2,1,0]))
 
         # reshape image to 4D 
         # PyTorch expects a 4-dimensional input, the first dimension being the number of samples
@@ -160,9 +189,6 @@ if not similar:
         # transform to float, otherwise there's mistake on double/float
         # shape = 1,3,32,32
         test = test.float() 
-
-        # eval mode
-        model.eval()
 
         # pooled features
         o_pooled = model(test)
@@ -173,23 +199,31 @@ if not similar:
         return o_pooled_flat
 
     # make into a function
-    def get_features_wsi_eval(wsi,model):
-        '''
-        wsi: SlideObject
-        get_features: function above: Tile -> Tensor
-        model: model loaded above
-        '''
-        features = []
-        for ti in wsi.tiles:
-            features.append(list(get_features_eval(ti,model)[0]))
-        return features
+    def get_features_wsi_eval(wsi,model,level,tissue_mask,ratio,tile_size):
+        i=0
+        j=0
+        coords=[]
+        embedding=[]
+        ratio1=ratio*int(2**level)
+        tile_size1=tile_size*int(2**level)
+        for i in tqdm(range(0,wsi.slide.get_image_shape(0)[0],tile_size1)):
+            while j<wsi.slide.get_image_shape(0)[1]:
+                if np.sum(tissue_mask[int(i/ratio1):int((i+tile_size1)/ratio1),int(j/ratio1):int((j+tile_size1)/ratio1)]==127)>2000:
+                    media = wsi.slide.extract_region(location = (i, j), level = level, size =(tile_size,tile_size))
+                    o_pooled_flat=get_features_eval(media,model)
+                    embedding.append(o_pooled_flat[0])
+                    coords.append([i,j])
+                j+=tile_size1
+            j=0
+            i+=tile_size1
+        return coords,embedding
     with torch.no_grad():
-        tile_ma = get_features_wsi_eval(wsi,model1)
-    assert len(coords)==len(tissue_masks)
-    assert len(tile_ma)==len(tissue_masks)
-    tile_ma=[tile_ma[i] for i in range(len(tile_ma)) if tissue_masks[i]>0]
-    coords=[coords[i] for i in range((len(coords))) if tissue_masks[i]>0]
-    diction={'emb':tile_ma,'coords':coords,'args':args}
+        coords,tile_ma = get_features_wsi_eval(wsi,model1,level_app,tissue_mask_high_level,ratio,args.tile_size)
+    #assert len(coords)==len(tissue_masks)
+    #assert len(tile_ma)==len(tissue_masks)
+    #tile_ma=[tile_ma[i] for i in range(len(tile_ma)) if tissue_masks[i]>0]
+    #coords=[coords[i] for i in range((len(coords))) if tissue_masks[i]>0]
+    diction={'emb':tile_ma,'coords':coords,'args':args,'level':level_app}
     now=str(int(time.time()))
     file_name=args.image_path.split('/')[-1].split('.')[0]+now+'.pickle'
     with open(os.path.join(args.prefix,file_name),'wb') as file:
@@ -200,17 +234,24 @@ else:
         media=pickle.load(file)
         tile_ma=media["emb"]
         coords=media["coords"]
+        level_app=media['level']
 n_clusters=5
+#print(coords[0:5])
 tile_ma=np.array(tile_ma,dtype=float)
 pca = PCA(n_components=2)
 pca_matrix=pca.fit_transform(tile_ma)
 kmean=KMeans(n_clusters=n_clusters, random_state=0).fit(tile_ma)
-thumbnail = wsi.slide.get_thumbnail(size = (5000, 5000))
+ratio=wsi.shape[0]/wsi.shape[1]
+if ratio>1:
+    thumbnail = wsi.slide.get_thumbnail(size = (10000,int(10000/ratio)))
+else:
+    thumbnail = wsi.slide.get_thumbnail(size = (int(10000*ratio),10000))
 color_list=['green','blue','orange','black','purple','yellow','pink']
 point_size=int(0.005*thumbnail.shape[0])
 layer2_data,point_matrix,min_col,min_row,max_row,max_col,matrix_min,matrix_max=generate_pca_point(thumbnail.shape[0],pca_matrix,point_size)
 line_width=8
-polys=gen_cluster_mask(coords,thumbnail.shape[0],thumbnail.data.shape[1],wsi.shape[0],wsi.shape[1],layer2_data.shape[1],args.tile_size)
+#print(thumbnail.shape)
+polys=gen_cluster_mask(coords,thumbnail.shape[0],thumbnail.shape[1],wsi.slide.get_image_shape(0)[0],wsi.slide.get_image_shape(0)[1],layer2_data.shape[1],args.tile_size*int(2**level_app))
 viewer = napari.Viewer()
 p_color_list=[color_list[i] for i in kmean.labels_]
 layer1=viewer.add_image(np.concatenate((layer2_data,thumbnail),axis=1),name='wsi')
