@@ -172,6 +172,9 @@ if not similar:
     model1 = load_model_weights(model1, state_dict)
     model1.fc = torch.nn.Sequential()
     model1.eval()
+    model_orig = torchvision.models.__dict__['resnet18'](pretrained=True)
+    model_orig.fc = torch.nn.Sequential()
+    model_orig.fc.eval()
     ###Generate Embedding
     def get_features_eval(t,model):
         """
@@ -219,11 +222,12 @@ if not similar:
         return coords,embedding
     with torch.no_grad():
         coords,tile_ma = get_features_wsi_eval(wsi,model1,level_app,tissue_mask_high_level,ratio,args.tile_size)
+        _,tile_orig = get_features_wsi_eval(wsi,model_orig,level_app,tissue_mask_high_level,ratio,args.tile_size)
     #assert len(coords)==len(tissue_masks)
     #assert len(tile_ma)==len(tissue_masks)
     #tile_ma=[tile_ma[i] for i in range(len(tile_ma)) if tissue_masks[i]>0]
     #coords=[coords[i] for i in range((len(coords))) if tissue_masks[i]>0]
-    diction={'emb':tile_ma,'coords':coords,'args':args,'level':level_app}
+    diction={'emb':tile_ma,'coords':coords,'args':args,'level':level_app,'emb_orig':tile_orig}
     now=str(int(time.time()))
     file_name=args.image_path.split('/')[-1].split('.')[0]+now+'.pickle'
     with open(os.path.join(args.prefix,file_name),'wb') as file:
@@ -235,12 +239,18 @@ else:
         tile_ma=media["emb"]
         coords=media["coords"]
         level_app=media['level']
-n_clusters=5
+        tile_orig=media['emb_orig']
+cur_n_clusters=5
+cur_orig=False
 #print(coords[0:5])
 tile_ma=np.array(tile_ma,dtype=float)
 pca = PCA(n_components=2)
 pca_matrix=pca.fit_transform(tile_ma)
-kmean=KMeans(n_clusters=n_clusters, random_state=0).fit(tile_ma)
+kmean=KMeans(n_clusters=cur_n_clusters, random_state=0).fit(tile_ma)
+tile_orig=np.array(tile_orig,dtype=float)
+pca_orig = PCA(n_components=2)
+pca_matrix_orig=pca.fit_transform(tile_orig)
+#kmean_orig=KMeans(n_clusters=cur_n_clusters, random_state=0).fit(tile_orig)
 ratio=wsi.shape[0]/wsi.shape[1]
 if ratio>1:
     thumbnail = wsi.slide.get_thumbnail(size = (10000,int(10000/ratio)))
@@ -249,15 +259,17 @@ else:
 color_list=['green','blue','orange','black','purple','yellow','pink']
 point_size=int(0.005*thumbnail.shape[0])
 layer2_data,point_matrix,min_col,min_row,max_row,max_col,matrix_min,matrix_max=generate_pca_point(thumbnail.shape[0],pca_matrix,point_size)
+layer2_data_orig,point_matrix_orig,min_col_orig,min_row_orig,max_row_orig,max_col_orig,matrix_min_orig,matrix_max_orig=generate_pca_point(thumbnail.shape[0],pca_matrix_orig,point_size)
 line_width=8
 #print(thumbnail.shape)
 polys=gen_cluster_mask(coords,thumbnail.shape[0],thumbnail.shape[1],wsi.slide.get_image_shape(0)[0],wsi.slide.get_image_shape(0)[1],layer2_data.shape[1],args.tile_size*int(2**level_app))
+polys_orig=gen_cluster_mask(coords,thumbnail.shape[0],thumbnail.shape[1],wsi.slide.get_image_shape(0)[0],wsi.slide.get_image_shape(0)[1],layer2_data_orig.shape[1],args.tile_size*int(2**level_app))
 viewer = napari.Viewer()
 p_color_list=[color_list[i] for i in kmean.labels_]
 layer1=viewer.add_image(np.concatenate((layer2_data,thumbnail),axis=1),name='wsi')
-layer2=viewer.add_points(point_matrix,size=point_size,properties={'coord_x':np.array(coords)[:,0],'coord_y':np.array(coords)[:,1]},edge_color=p_color_list,name='pca plot')
+layer2=viewer.add_points(point_matrix,size=point_size,edge_color=p_color_list,name='pca plot')
 layer3=viewer.add_points(point_matrix[0:1],size=point_size*3,symbol='cross',opacity=0,edge_color='red',face_color='red',name='cross')
-layer4=viewer.add_shapes(polys,properties={'coord_x':pca_matrix[:,0],'coord_y':pca_matrix[:,1]},edge_width=0,face_color=p_color_list,opacity=0.5,name='tile')
+layer4=viewer.add_shapes(polys,edge_width=0,face_color=p_color_list,opacity=0.5,name='tile')
 layer5=viewer.add_shapes(np.array([[1114,2997.5],[1114,3064],[1178,3064],[1178,3000],[1111.5,3000]]),edge_color='red',edge_width=line_width,shape_type='path',opacity=0.0,name='grid')
 layer1.editable=False
 layer3.editable=False
@@ -291,9 +303,51 @@ def update_cross_position(event):
 layer4.events.mode.connect(update_cross_position)
 @magicgui(slider_int={"widget_type": "Slider", "min": 1,'max':7,'label': 'Clusters of Kmeans'})
 def slider(slider_int=5):
-    kmean=KMeans(n_clusters=slider_int, random_state=0).fit(tile_ma)
+    global cur_n_clusters
+    cur_n_clusters=slider_int
+    if cur_orig:
+        kmean=KMeans(n_clusters=slider_int, random_state=0).fit(tile_orig)
+    else:
+        kmean=KMeans(n_clusters=slider_int, random_state=0).fit(tile_ma)
     p_color_list=[color_list[i] for i in kmean.labels_]
     layer2.edge_color=p_color_list
     layer4.face_color=p_color_list
 viewer.window.add_dock_widget(slider)
+@magicgui(radio_option={
+        "widget_type": "RadioButtons",
+        "orientation": "vertical",
+        "choices": [("orig_resnet", True), ("path_resent", False)]})
+def radio(radio_option=False):
+    global cur_orig
+    global cur_n_clusters
+    if radio_option != cur_orig:
+        cur_orig=radio_option
+        layer3.opacity=0.0
+        layer5.opacity=0.0
+        if cur_orig:
+            kmean=KMeans(n_clusters=cur_n_clusters, random_state=0).fit(tile_orig)
+            print(kmean.labels_[0:20])
+            p_color_list=[color_list[i] for i in kmean.labels_]
+            layer1.data=np.concatenate((layer2_data_orig,thumbnail),axis=1)
+            layer2.data=point_matrix_orig
+            layer2.edge_color=p_color_list
+            layer4.data=polys_orig
+            layer4.face_color=p_color_list
+            
+        else:
+            kmean=KMeans(n_clusters=cur_n_clusters, random_state=0).fit(tile_ma)
+            print(kmean.labels_[0:20])
+            p_color_list=[color_list[i] for i in kmean.labels_]
+            layer1.data=np.concatenate((layer2_data,thumbnail),axis=1)
+            layer2.data=point_matrix
+            layer2.edge_color=p_color_list
+            layer4.data=polys
+            layer4.face_color=p_color_list
+    """        
+    kmean=KMeans(n_clusters=slider_int, random_state=0).fit(tile_ma)
+    p_color_list=[color_list[i] for i in kmean.labels_]
+    layer2.edge_color=p_color_list
+    layer4.face_color=p_color_list
+    """
+viewer.window.add_dock_widget(radio)
 napari.run()
