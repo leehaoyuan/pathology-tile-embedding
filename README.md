@@ -14,6 +14,7 @@ Camelyon 2016 dataset. This can be applied to any pathology images.
 ## How to run pipeline
 Run pipeline by running
 python main.py 
+
 --image_path [path of the input wsi]
 
 --model_path [path of the model to generate embedding] 
