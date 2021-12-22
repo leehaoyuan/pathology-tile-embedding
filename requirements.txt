@@ -1,0 +1,9 @@
+numpy
+sklearn
+napari
+magicgui
+xml
+torch
+torchvision
+shapely
+nest_asyncio
