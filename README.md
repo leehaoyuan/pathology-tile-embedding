@@ -17,7 +17,7 @@ python main.py
 
 --image_path [path of the input wsi]
 
---model_path [path of the model to generate embedding] 
+--model_path [path of the resnet18.ckpt to generate embedding] 
 
 --prefix [path to store the media data] 
 
@@ -30,6 +30,8 @@ python main.py
 --tissue_ratio [filter out tiles whose tissue ratio is below this value]
 
 If there is no media data in the prefix directory, program will run preprocessing from very begining and could take a long time. Otherwise, preprocessed data will be loaded.
+
+An example commandline: python napari_ui.py --image_path test_046.tif --model_path tenpercent_resnet18.ckpt --prefix media1 --tile_size 256 --xml_path test_046.xml --level 1 --tissue_ratio 0.8
 ## Requirement
 Aside from packages listed in requirment.txt, the program also needs pathml. Please refer to their [homepage](https://github.com/Dana-Farber-AIOS/pathml) for instruction of installation. 
 ## xml_parser
