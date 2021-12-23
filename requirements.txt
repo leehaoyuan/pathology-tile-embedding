@@ -1,8 +1,8 @@
 numpy
+pathml==1.0.3
 sklearn
 napari
 magicgui
-xml
 torch
 torchvision
 shapely
